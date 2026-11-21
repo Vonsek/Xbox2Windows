@@ -24,6 +24,27 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends llvm-15
           python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+  python-linux:
+    name: Run platform-independent Python checks on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - name: Install fixture dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run Python checks
+        run: |
+          python -B tests/script_state_check.py
+          python -B tests/bcpack_check.py
+          python -B tests/resource_ranges_check.py
+          python -B tests/dxcontainer_part_offsets_check.py
+          python -B tests/layout_chunks_check.py
+          python -B tests/intake/paths_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
