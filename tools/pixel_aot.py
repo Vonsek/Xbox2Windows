@@ -1283,6 +1283,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
             if op == "s_addk_i32":
                 scc = f"((({operand} ^ alu{i}) & ({addend}u ^ alu{i}) & 0x80000000u) != 0u)"
+        elif m := match(r"s_cmpk_(eq|lg|gt|ge|lt|le)_(i32|u32) (s\d+), (0x[0-9a-f]{1,4}|\d+)"):
+            # SCC = S0 against SIMM16, sign-extended for _i32 and zero-extended for _u32. S0 is the SDST field.
+            relation, kind, src, imm = m.groups()
+            value = scalar_u32(sgpr_name(src), scalar, pending)
+            word = int(imm, 0)
+            if word > 0xffff:
+                raise ValueError("Invalid sopk immediate")
+            op_sym = {"eq": "==", "lg": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[relation]
+            if kind == "i32":
+                cond = f"(asint({value}) {op_sym} {word - 0x10000 if word & 0x8000 else word})"
+            else:
+                cond = f"({value} {op_sym} {word}u)"
+            lines.append(f"    bool scc{i} = {cond};")
+            scc = f"scc{i}"
+        elif m := match(r"s_cmovk_i32 (s\d+), (0x[0-9a-f]{1,4}|\d+)"):
+            # D = SCC ? sign-extended SIMM16 : D. The old value must be a known scalar result.
+            dst, imm = m.groups()
+            word = int(imm, 0)
+            if word > 0xffff:
+                raise ValueError("Invalid sopk immediate")
+            if scc is None:
+                raise ValueError("Conditional move requires a tracked SCC")
+            old = scalar_u32(sgpr_name(dst), scalar, pending)
+            lines.append(f"    uint salu{i} = {scc} ? {(word - 0x10000 if word & 0x8000 else word) & 0xffffffff}u : {old};")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)

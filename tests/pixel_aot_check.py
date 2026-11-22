@@ -1943,13 +1943,13 @@ def check_scalar_controls():
                 "s_add_u32 s62, s90, s45", "s_add_u32 s62, vcc_lo, s45", "s_add_u32 s62, exec_lo, s45",
                 "s_add_u32 s62, v12, s45", "s_add_u32 m0, s44, s45", "s_add_u32 vcc_lo, s44, s45",
                 "s_add_u32 s62, s44, |s45|",
-                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45", "s_cmpk_eq_u32 s44, 0x10",
+                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45", "s_cmov_b32 s62, s44",
                 "s_cmp_lt_i32 s44", "s_cmp_lt_f32 s44, s45"):
         changed = [line.replace(first, new) for line in program]
         assert changed != program, new
         must_reject(translate, changed)
     flag = program.index(first) + 1
-    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x1", "s_cselect_b32 s63, s28, 0",
+    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmov_b32 s63, 1", "s_cselect_b32 s63, s28, 0",
                 "s_cselect_b32 vcc_lo, 1, 0"):
         must_reject(translate, program[:flag] + [new] + program[flag + 1:])
     # Before lgkmcnt(0) the constant words are still loading: neither read nor overwrite them.
@@ -1958,6 +1958,214 @@ def check_scalar_controls():
                  "s_cselect_b32 s47, 1, 0"):
         must_reject(translate, program[:load] + ["s_cmp_eq_u32 1, 1", line] + program[load:])
     translate(program[:load] + ["s_cmp_eq_u32 1, 1", "s_cselect_b32 s62, 1, 0"] + program[load:])
+
+
+# SOPK compares and the conditional move immediate. Each s_cmpk_* outcome sets its own bit of s60 through
+# s_cselect_b32; s61 and s59 each take an s_cmovk_i32 whose SCC comes from an s_cmpk. sopk_program(k) exports the
+# four bytes of SOPK_RESULTS[k] through v_cvt_f32_ubyte0-3, so each channel is an exact integer 0..255.
+# The immediate is printed as LLVM prints it, 0x0 to 0xffff; _i32 sign-extends it and _u32 zero-extends it.
+SOPK_FORMS = tuple(f"s_cmpk_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu") + ("s_cmovk_i32",)
+SOPK_COMPARES = (
+    "s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s45, 0x7fff",
+    "s_cmpk_eq_u32 s45, 0x8000", "s_cmpk_eq_u32 s46, 0x7fff",
+    "s_cmpk_lg_i32 s44, 0x8000", "s_cmpk_lg_i32 s45, 0x7fff",
+    "s_cmpk_lg_u32 s45, 0x8000", "s_cmpk_lg_u32 s46, 0x7fff",
+    "s_cmpk_gt_i32 s47, 0x0", "s_cmpk_gt_i32 s45, 0x7fff",
+    "s_cmpk_gt_u32 s46, 0x8000", "s_cmpk_gt_u32 s45, 0x7fff",
+    "s_cmpk_ge_i32 s44, 0x8000", "s_cmpk_ge_i32 s47, 0x0",
+    "s_cmpk_ge_u32 s45, 0x8000", "s_cmpk_ge_u32 s46, 0x8000",
+    "s_cmpk_lt_i32 s44, 0x8000", "s_cmpk_lt_i32 s47, 0x0",
+    "s_cmpk_lt_u32 s45, 0x8000", "s_cmpk_lt_u32 s46, 0x8000",
+    "s_cmpk_le_i32 s47, 0x0", "s_cmpk_le_i32 s45, 0x7fff",
+    "s_cmpk_le_u32 s46, 0x8000", "s_cmpk_le_u32 s45, 0x7fff",
+)
+SOPK_MOVES = ("s_mov_b32 s61, s47", "s_cmpk_lt_i32 s47, 0x1", "s_cmovk_i32 s61, 0x8001",
+              "s_mov_b32 s59, s46", "s_cmpk_ge_u32 s46, 0x8001", "s_cmovk_i32 s59, 0x7ffe")
+SOPK_RESULTS = ("s60", "s61", "s59")
+# Constant words 3 to 6 (s44 to s47). Every compare and both s_cmovk_i32 conditions differ between the sets, and
+# a = -32768 = sext(0x8000) in the first set; b straddles 0x8000; d straddles the signed range limit.
+SOPK_WORDS = ((0xffff8000, 0x8000, 0x7fff, 0x80000000), (0xffff7fff, 0x7fff, 0x10000, 0x7fffffff))
+
+
+def sopk_body():
+    body = ["s_mov_b32 s60, 0"]
+    for bit, step in enumerate(SOPK_COMPARES):
+        flag = 1 << bit
+        body += [step, f"s_cselect_b32 s63, {flag if flag <= 64 else hex(flag)}, 0", "s_or_b32 s60, s60, s63"]
+    return body + list(SOPK_MOVES)
+
+
+def sopk_program(k, body=None):
+    return with_constants([*(sopk_body() if body is None else body), f"v_mov_b32_e32 v18, {SOPK_RESULTS[k]}",
+                           *(f"v_cvt_f32_ubyte{n}_e32 v{12 + n}, v18" for n in range(4))])
+
+
+def sopk_reference(body, words):
+    """Independent model of the RDNA 2 ISA definitions on Python integers: the words SOPK_RESULTS name, and the
+    SCC of every compare in program order."""
+    regs = dict(zip(("s44", "s45", "s46", "s47"), words))
+    scc, outcomes = None, []
+
+    def sext16(k):
+        return k - 0x10000 if k & 0x8000 else k
+
+    def signed(x):
+        return x - (1 << 32) if x >> 31 else x
+
+    for line in body:
+        op, operands = line.split(" ", 1)
+        args = operands.split(", ")
+        value = (lambda t: regs[t] if t in regs else int(t, 0))
+        if op.startswith("s_cmpk_"):
+            relation, kind = op[7:9], op[10]
+            k = int(args[1], 16)
+            left, right = (signed(regs[args[0]]), sext16(k)) if kind == "i" else (regs[args[0]], k)
+            scc = {"eq": left == right, "lg": left != right, "gt": left > right, "ge": left >= right,
+                   "lt": left < right, "le": left <= right}[relation]
+            outcomes.append(scc)
+        elif op == "s_cmovk_i32":
+            if scc:
+                regs[args[0]] = sext16(int(args[1], 16)) & 0xffffffff
+        elif op == "s_movk_i32":
+            regs[args[0]] = sext16(int(args[1], 16)) & 0xffffffff
+        elif op == "s_mov_b32":
+            regs[args[0]] = value(args[1])
+        elif op == "s_cselect_b32":
+            regs[args[0]] = value(args[1]) if scc else value(args[2])
+        elif op == "s_or_b32":
+            regs[args[0]] = value(args[1]) | value(args[2])
+            scc = regs[args[0]] != 0
+        else:
+            raise ValueError(line)
+    return [regs[r] for r in SOPK_RESULTS], outcomes
+
+
+# (exported result, old text, new text): signedness of a compare, sign- against zero-extension of the immediate,
+# the equality boundary, and an s_cmovk_i32 that ignores SCC.
+SOPK_MUTATIONS = (
+    (0, "s_cmpk_lt_i32 s44, 0x8000", "s_cmpk_lt_u32 s44, 0x8000"),
+    (0, "s_cmpk_gt_u32 s46, 0x8000", "s_cmpk_gt_i32 s46, 0x8000"),
+    (0, "s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_u32 s44, 0x8000"),
+    (0, "s_cmpk_ge_i32 s44, 0x8000", "s_cmpk_gt_i32 s44, 0x8000"),
+    (1, "s_cmpk_lt_i32 s47, 0x1", "s_cmpk_lt_u32 s47, 0x1"),
+    (1, "s_cmovk_i32 s61, 0x8001", "s_movk_i32 s61, 0x8001"),
+    (2, "s_cmpk_ge_u32 s46, 0x8001", "s_cmpk_ge_i32 s46, 0x8001"),
+)
+
+
+def sopk_detecting_words(k, old, new):
+    """The first constant set on which the mutation changes exported result k."""
+    body = sopk_body()
+    changed = [line.replace(old, new) for line in body]
+    assert changed != body, old
+    return next(words for words in SOPK_WORDS
+                if sopk_reference(changed, words)[0][k] != sopk_reference(body, words)[0][k])
+
+
+def check_sopk_controls():
+    source = translate(sopk_program(0))
+    assert set(SOPK_FORMS) <= ACCEPTED
+    s44, s45, s46, s47 = (f"asuint(params[{n // 4}].{'xyzw'[n % 4]})" for n in range(3, 7))
+    for expected in (
+        f"= (asint({s44}) == -32768);", f"= (asint({s45}) == 32767);",
+        f"= ({s45} == 32768u);", f"= ({s46} != 32767u);",
+        f"= (asint({s47}) > 0);", f"= ({s46} > 32768u);",
+        f"= (asint({s44}) >= -32768);", f"= ({s45} >= 32768u);",
+        f"= (asint({s44}) < -32768);", f"= ({s46} < 32768u);",
+        f"= (asint({s45}) <= 32767);", f"= ({s45} <= 32767u);",
+        f"= (asint({s47}) < 1);", f"= ({s46} >= 32769u);",
+        f" ? 4294934529u : {s47};", f" ? 32766u : {s46};",
+    ):
+        assert expected in source, expected
+    # Every compare and both conditional moves take each outcome across the two constant sets.
+    flags = [sopk_reference(sopk_body(), words)[1] for words in SOPK_WORDS]
+    assert len(flags[0]) == len(SOPK_COMPARES) + 2
+    assert all(a != b for a, b in zip(*flags)), flags
+    for k, old, new in SOPK_MUTATIONS:
+        sopk_detecting_words(k, old, new)
+    # A register written by s_movk_i32 is a known constant; the compare reads it as a uint literal.
+    known = translate(with_constants(["s_movk_i32 s50, 0x8000", "s_cmpk_eq_i32 s50, 0x8000",
+                                      "s_cmovk_i32 s50, 0x1"]))
+    assert "(asint(4294934528u) == -32768);" in known and " ? 1u : 4294934528u;" in known
+    program = sopk_program(1)
+    first, move = "s_cmpk_eq_i32 s44, 0x8000", "s_cmovk_i32 s61, 0x8001"
+    for bad in (
+        "s_cmpk_eq_i32 s44, 0x10000", "s_cmpk_eq_i32 s44, -1", "s_cmpk_eq_i32 s44, 1.0",
+        "s_cmpk_eq_i32 s44", "s_cmpk_eq_i32 s44, 0x8000, 0x1", "s_cmpk_eq_i32 v12, 0x8000",
+        "s_cmpk_eq_i32 s106, 0x8000", "s_cmpk_eq_i32 vcc_lo, 0x8000", "s_cmpk_eq_i32 m0, 0x8000",
+        "s_cmpk_eq_i32 s[44:45], 0x8000", "s_cmpk_eq_i32 0x10, 0x8000", "s_cmpk_eq_i32 s90, 0x8000",
+        "s_cmpk_eq_i32 s20, 0x8000", "s_cmpk_eq_i32 s28, 0x8000",
+        # Neighbours that stay unlowered: the register conditional move and the hardware-register moves.
+        "s_cmov_b32 s63, s44", "s_getreg_b32 s63, hwreg(HW_REG_MODE)",
+        "s_setreg_b32 hwreg(HW_REG_MODE), s44",
+    ):
+        changed = [line.replace(first, bad) for line in program]
+        assert changed != program, bad
+        must_reject(translate, changed)
+    for bad in ("s_cmovk_i32 s61, 0x10000", "s_cmovk_i32 s61, -1", "s_cmovk_i32 s61", "s_cmovk_i32 v12, 0x8001",
+                "s_cmovk_i32 vcc_lo, 0x8001", "s_cmovk_i32 m0, 0x8001", "s_cmovk_i32 s70, 0x8001",
+                "s_cmovk_i32 s61, s44", "s_cmovk_i32 s[60:61], 0x8001", "s_cmovk_i32 s106, 0x8001"):
+        changed = [line.replace(move, bad) for line in program]
+        assert changed != program, bad
+        must_reject(translate, changed)
+    # s_cmovk_i32 needs a tracked SCC; the exec-mask operations clear it.
+    base = assembly(False)
+    wqm = base.index("s_wqm_b64 exec, exec")
+    andexec = base.index("s_and_b64 exec, exec, s[50:51]")
+    translate(base[:andexec] + ["s_mov_b32 s62, 7", "s_cmpk_lg_u32 s62, 0x7", "s_cmovk_i32 s62, 0x1"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s62, 7", "s_cmovk_i32 s62, 0x1"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s62, 7", "s_cmpk_lg_u32 s62, 0x7"] + base[andexec:andexec + 1]
+                + ["s_cmovk_i32 s62, 0x1"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_mov_b32 s62, 7", "s_cmpk_lg_u32 s62, 0x7"] + base[wqm:wqm + 1]
+                + ["s_cmovk_i32 s62, 0x1"] + base[wqm + 1:])
+    # Before lgkmcnt(0) the constant words are still loading: neither compare nor conditionally overwrite them.
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    must_reject(translate, program[:load] + ["s_cmpk_eq_u32 s44, 0x1"] + program[load:])
+    must_reject(translate, program[:load] + ["s_mov_b32 s62, 7", "s_cmpk_lg_u32 s62, 0x7", "s_cmovk_i32 s45, 0x1"]
+                + program[load:])
+    translate(program[:load] + ["s_mov_b32 s62, 7", "s_cmpk_lg_u32 s62, 0x7", "s_cmovk_i32 s62, 0x1"] + program[load:])
+
+
+def sopk_case(path, words, word):
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *words)
+    path.write_bytes(constants + struct.pack("<4f", *[float((word >> 8 * n) & 0xff) for n in range(4)]) * 64)
+
+
+def check_sopk_draws(directory, compiler, renderer, backend):
+    source = directory / "sopk_compare.hlsl"
+    shader = directory / "sopk_compare.cso"
+    case = directory / "sopk_compare.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    for k in range(len(SOPK_RESULTS)):
+        source.write_text(translate(sopk_program(k)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for words in SOPK_WORDS:
+            sopk_case(case, words, sopk_reference(sopk_body(), words)[0][k])
+            subprocess.run(draw, check=True)
+    # Each mutation changes the exported word on its detecting set (checked in the controls), so the draw against
+    # the correct reference must report a mismatch.
+    for k, old, new in SOPK_MUTATIONS:
+        words = sopk_detecting_words(k, old, new)
+        mutated = [line.replace(old, new) for line in sopk_body()]
+        source.write_text(translate(sopk_program(k, mutated)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        sopk_case(case, words, sopk_reference(sopk_body(), words)[0][k])
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Replacing {old} with {new} escaped detection")
+
+
+def check_sopk_render(directory, compiler, renderer, backend):
+    """The SOPK compare draws as their own CTest entry per backend; exit 77 from the renderer is a skip."""
+    try:
+        check_sopk_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
 
 
 # SDWA moves and half widening. In SDWA_PRESERVE_BODY each move writes a 16-bit field into WORD_0 of a register
@@ -2762,6 +2970,7 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_cvt_f32_f16_e32 v12, 1.0"]))
     must_reject(translate, with_constants(["v_cvt_f32_f16_sdwa v12, s44 src0_sel:WORD_1"]))
     check_scalar_controls()
+    check_sopk_controls()
     # v_cvt_f16_f32 keeps the destination's high half and narrows the modified source through narrow16.
     body = translate(with_constants(NARROW_BODY)).split("float4 main", 1)[1]
     assert body.count("narrow16(") == 3 and body.count("& 0xffff0000u) | narrow16(") == 3, body
@@ -3290,6 +3499,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
     fixtures.append((scalar(), translate))
+    fixtures.extend((sopk_program(k), translate) for k in range(len(SOPK_RESULTS)))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
@@ -3961,6 +4171,9 @@ def main():
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
+        if mode == "draw-sopk":
+            # As for draw-e64, the controls run in the binary and draw modes.
+            return check_sopk_render(directory, *args)
         check_controls(directory)
         if mode == "binary":
             check_binary(directory, *args)
@@ -3971,7 +4184,7 @@ def main():
         elif mode == "buffer-color":
             return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary, draw, draw-e64, three-way or buffer-color mode")
+            raise ValueError("Expected binary, draw, draw-e64, draw-sopk, three-way or buffer-color mode")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_and_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
     r"(?:s_mov_b32|s_movk_i32)\s+(?:s\d+|m0),\s+.*",
     r"(?:s_addk_i32|s_mulk_i32)\s+s\d+,\s+(?:-?\d+|0x[0-9a-f]+)",
+    r"(?:s_cmpk_(?:eq|lg|gt|ge|lt|le)_[iu]32|s_cmovk_i32)\s+s\d+,\s+(?:0x[0-9a-f]{1,4}|\d+)",
     r"s_load_dwordx8\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+null",
     r"(?:s_load_dwordx4|s_buffer_load_dwordx4)\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+.*",
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
@@ -86,6 +87,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_ashr_i32", "s_ashr_i64", "s_mul_i32",
     # SOPK
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
+    *(f"s_cmpk_{relation}_{kind}32" for relation in ("eq", "lg", "gt", "ge", "lt", "le") for kind in "iu"),
     # VOP1
     "v_nop", "v_mov_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",

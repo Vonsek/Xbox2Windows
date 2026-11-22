@@ -38,6 +38,12 @@ def check_scanner_tracks_pixel_aot():
     assert not is_instruction_supported("v_bfi_b32_e32 v0, v1, v2, v3")
     assert not is_instruction_supported("v_xor_b32 v0, v1")
     assert not is_instruction_supported("v_not_b32 v0, -v1")
+    # The SOPK compares and s_cmovk_i32 take an SGPR and the 16-bit immediate as LLVM prints it.
+    for opcode in (*(f"s_cmpk_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu"), "s_cmovk_i32"):
+        assert is_opcode_recognized(opcode), opcode
+        assert is_instruction_supported(f"{opcode} s44, 0x8000"), opcode
+        assert not is_instruction_supported(f"{opcode} s44, 0x10000"), opcode
+        assert not is_instruction_supported(f"{opcode} v1, 0x1"), opcode
 
 
 def check():
